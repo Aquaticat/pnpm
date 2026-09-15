@@ -20,7 +20,7 @@ use openidconnect::{
     OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, TokenResponse,
     core::{
         CoreAuthenticationFlow, CoreClient, CoreClientAuthMethod, CoreIdToken, CoreIdTokenVerifier,
-        CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreTokenResponse,
+        CoreJsonWebKeySet, CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreTokenResponse,
     },
 };
 use p256::ecdsa::{
@@ -73,8 +73,17 @@ struct Provider {
 
 #[derive(Default)]
 struct MetadataCache {
-    value: Option<(Instant, CoreProviderMetadata)>,
+    value: Option<(Instant, Discovered)>,
     attempted_at: Option<Instant>,
+}
+
+/// What discovery fetched for one provider. Workload verification reads only
+/// the signing keys; browser login also needs the provider's endpoints, which
+/// workload-only issuers such as GitHub Actions do not publish.
+#[derive(Clone)]
+struct Discovered {
+    jwks: CoreJsonWebKeySet,
+    login: Option<CoreProviderMetadata>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -134,7 +143,7 @@ impl OidcState {
         if provider.config.login.is_none() {
             return Err(RegistryError::NotFound);
         }
-        let metadata = self.metadata(provider, false).await?;
+        let metadata = self.metadata(provider, false).await?.login.ok_or_else(rejected)?;
         let client = self.login_client(provider, metadata)?;
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
         let (url, state, nonce) = client
@@ -168,7 +177,7 @@ impl OidcState {
         let _exchange = self.exchanges.try_acquire().map_err(|_| unavailable())?;
         self.record_attempt(&login.state_hash)?;
         let provider = self.providers.get(provider_name).ok_or_else(rejected)?;
-        let metadata = self.metadata(provider, false).await?;
+        let metadata = self.metadata(provider, false).await?.login.ok_or_else(rejected)?;
         let response = self
             .login_client(provider, metadata.clone())?
             .exchange_code(AuthorizationCode::new(code.to_string()))
@@ -180,7 +189,7 @@ impl OidcState {
         let token = response.id_token().ok_or_else(rejected)?;
         let expiration = self.verified_expiration(
             provider,
-            &metadata,
+            metadata.jwks(),
             &response,
             token,
             &Nonce::new(login.nonce),
@@ -233,14 +242,14 @@ impl OidcState {
     async fn verified_expiration(
         &self,
         provider: &Provider,
-        metadata: &CoreProviderMetadata,
+        jwks: &CoreJsonWebKeySet,
         response: &CoreTokenResponse,
         token: &CoreIdToken,
         nonce: &Nonce,
     ) -> Result<i64> {
-        let mut verifier = token_verifier(&provider.config, metadata)?;
+        let mut verifier = token_verifier(&provider.config, jwks)?;
         if token.claims(&verifier, nonce).is_err() {
-            verifier = token_verifier(&provider.config, &self.metadata(provider, true).await?)?;
+            verifier = token_verifier(&provider.config, &self.metadata(provider, true).await?.jwks)?;
         }
         let claims = token.claims(&verifier, nonce).map_err(|_| rejected())?;
         if let Some(expected) = claims.access_token_hash() {
@@ -333,7 +342,7 @@ impl OidcState {
         ))
     }
 
-    async fn metadata(&self, provider: &Provider, refresh: bool) -> Result<CoreProviderMetadata> {
+    async fn metadata(&self, provider: &Provider, refresh: bool) -> Result<Discovered> {
         let cached = cached_metadata(&*provider.metadata.lock().await, refresh);
         if let Some(metadata) = cached {
             return Ok(metadata);
@@ -350,14 +359,19 @@ impl OidcState {
             cache.attempted_at = Some(Instant::now());
         }
         let issuer = IssuerUrl::new(provider.config.issuer.clone()).map_err(|_| rejected())?;
-        let metadata =
-            CoreProviderMetadata::discover_async(issuer, self).await.map_err(|_| unavailable())?;
-        secure_url(metadata.authorization_endpoint().as_str())?;
-        if let Some(endpoint) = metadata.token_endpoint() {
-            secure_url(endpoint.as_str())?;
-        }
-        provider.metadata.lock().await.value = Some((Instant::now(), metadata.clone()));
-        Ok(metadata)
+        let discovered = if provider.config.login.is_some() {
+            let metadata =
+                CoreProviderMetadata::discover_async(issuer, self).await.map_err(|_| unavailable())?;
+            secure_url(metadata.authorization_endpoint().as_str())?;
+            if let Some(endpoint) = metadata.token_endpoint() {
+                secure_url(endpoint.as_str())?;
+            }
+            Discovered { jwks: metadata.jwks().clone(), login: Some(metadata) }
+        } else {
+            Discovered { jwks: self.workload_keys(&issuer).await?, login: None }
+        };
+        provider.metadata.lock().await.value = Some((Instant::now(), discovered.clone()));
+        Ok(discovered)
     }
 
     async fn http_request(&self, request: HttpRequest) -> Result<HttpResponse> {
@@ -386,7 +400,7 @@ impl OidcState {
     }
 }
 
-fn cached_metadata(cache: &MetadataCache, refresh: bool) -> Option<CoreProviderMetadata> {
+fn cached_metadata(cache: &MetadataCache, refresh: bool) -> Option<Discovered> {
     let recently_attempted = cache.attempted_at.is_some_and(|at| at.elapsed() < REFRESH_INTERVAL);
     cache.value
         .as_ref()

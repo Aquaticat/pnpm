@@ -1,7 +1,21 @@
 use super::{
-    OidcState, OidcWorkload, Provider, Result, Value, match_workload_binding, rejected,
-    token_payload, verify_workload,
+    CoreJsonWebKeySet, IssuerUrl, OidcState, OidcWorkload, Provider, Result, Value,
+    match_workload_binding, rejected, token_payload, unavailable, verify_workload,
 };
+use openidconnect::{
+    JsonWebKeySetUrl,
+    http::{Method, Request, StatusCode, header::ACCEPT},
+};
+use serde::Deserialize;
+
+/// The discovery fields workload verification reads. Full provider metadata
+/// also requires `authorization_endpoint`, which issuers that only mint
+/// workload ID tokens, such as GitHub Actions, do not publish.
+#[derive(Deserialize)]
+struct WorkloadDiscovery {
+    issuer: IssuerUrl,
+    jwks_uri: JsonWebKeySetUrl,
+}
 
 impl OidcState {
     /// Verifies workload credentials against configured issuers only. The returned restrictions
@@ -40,10 +54,36 @@ impl OidcState {
         raw: &str,
     ) -> Result<bool> {
         let metadata = self.metadata(provider, false).await?;
-        if verify_workload(&provider.config, &metadata, raw).is_ok() {
+        if verify_workload(&provider.config, &metadata.jwks, raw).is_ok() {
             return Ok(true);
         }
         let refreshed = self.metadata(provider, true).await?;
-        Ok(verify_workload(&provider.config, &refreshed, raw).is_ok())
+        Ok(verify_workload(&provider.config, &refreshed.jwks, raw).is_ok())
+    }
+
+    /// Fetches the signing keys of an issuer that has no browser login
+    /// configured, reading only the discovery fields workload tokens need.
+    pub(super) async fn workload_keys(&self, issuer: &IssuerUrl) -> Result<CoreJsonWebKeySet> {
+        let discovery_url = issuer
+            .join(".well-known/openid-configuration")
+            .map_err(|_| unavailable())?;
+        let request = Request::builder()
+            .uri(discovery_url.as_str())
+            .method(Method::GET)
+            .header(ACCEPT, "application/json")
+            .body(Vec::new())
+            .map_err(|_| unavailable())?;
+        let response = self.http_request(request).await?;
+        if response.status() != StatusCode::OK {
+            return Err(unavailable());
+        }
+        let discovery: WorkloadDiscovery =
+            serde_json::from_slice(response.body()).map_err(|_| unavailable())?;
+        if discovery.issuer != *issuer {
+            return Err(unavailable());
+        }
+        CoreJsonWebKeySet::fetch_async(&discovery.jwks_uri, self)
+            .await
+            .map_err(|_| unavailable())
     }
 }

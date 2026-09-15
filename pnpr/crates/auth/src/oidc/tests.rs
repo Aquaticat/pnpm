@@ -78,7 +78,7 @@ fn verifies_signature_issuer_audience_and_times() {
     let config = config(issuer);
     let metadata: CoreProviderMetadata = serde_json::from_value(metadata(issuer)).unwrap();
     let metadata = metadata.set_jwks(serde_json::from_value(jwks(&signing_key())).unwrap());
-    verify_workload(&config, &metadata, &sign(&payload(issuer), &signing_key())).unwrap();
+    verify_workload(&config, metadata.jwks(), &sign(&payload(issuer), &signing_key())).unwrap();
     for (claim, value) in [
         ("iss", json!("https://attacker.example")),
         ("aud", json!("other")),
@@ -91,18 +91,18 @@ fn verifies_signature_issuer_audience_and_times() {
         let mut claims = payload(issuer);
         claims[claim] = value;
         assert!(
-            verify_workload(&config, &metadata, &sign(&claims, &signing_key())).is_err(),
+            verify_workload(&config, metadata.jwks(), &sign(&claims, &signing_key())).is_err(),
             "accepted {claim}: {claims}",
         );
     }
     let other_key = SigningKey::from_bytes((&[43u8; 32]).into()).unwrap();
-    assert!(verify_workload(&config, &metadata, &sign(&payload(issuer), &other_key)).is_err());
+    assert!(verify_workload(&config, metadata.jwks(), &sign(&payload(issuer), &other_key)).is_err());
     let unsigned = format!(
         "{}.{}.",
         BASE64_URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
         BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload(issuer)).unwrap()),
     );
-    assert!(verify_workload(&config, &metadata, &unsigned).is_err());
+    assert!(verify_workload(&config, metadata.jwks(), &unsigned).is_err());
     for missing in ["iss", "aud", "sub", "exp", "iat"] {
         let mut claims = payload(issuer);
         claims
@@ -110,7 +110,7 @@ fn verifies_signature_issuer_audience_and_times() {
             .unwrap()
             .remove(missing);
         assert!(
-            verify_workload(&config, &metadata, &sign(&claims, &signing_key())).is_err(),
+            verify_workload(&config, metadata.jwks(), &sign(&claims, &signing_key())).is_err(),
             "accepted missing {missing}",
         );
     }
@@ -140,6 +140,7 @@ struct MockProvider {
     token_requests: Mutex<usize>,
     auth_method: Mutex<String>,
     discovery: DiscoveryGate,
+    workload_only_document: std::sync::atomic::AtomicBool,
 }
 #[derive(Default)]
 struct DiscoveryGate {
@@ -159,12 +160,21 @@ async fn mock_provider() -> (Arc<MockProvider>, tokio::task::JoinHandle<()>) {
         token_requests: Mutex::new(0),
         auth_method: Mutex::new("client_secret_basic".to_string()),
         discovery: DiscoveryGate::default(),
+        workload_only_document: std::sync::atomic::AtomicBool::new(false),
     });
     let router = Router::new()
         .route("/.well-known/openid-configuration", get(async |State(state): State<Arc<MockProvider>>| {
                 state.discovery.wait().await;
                 let mut document = metadata(&state.issuer);
                 document["token_endpoint_auth_methods_supported"] = json!([*state.auth_method.lock().unwrap()]);
+                if state.workload_only_document.load(std::sync::atomic::Ordering::Relaxed) {
+                    // GitHub Actions' issuer serves ID tokens only and publishes no login endpoints.
+                    let fields = document.as_object_mut().unwrap();
+                    for field in ["authorization_endpoint", "token_endpoint", "token_endpoint_auth_methods_supported"] {
+                        fields.remove(field);
+                    }
+                    document["response_types_supported"] = json!(["id_token"]);
+                }
                 Json(document)
             }))
         .route("/jwks", get(async |State(state): State<Arc<MockProvider>>| {
@@ -234,6 +244,26 @@ async fn discovers_caches_and_enforces_workload_bindings() {
             .unwrap()
             .is_none(),
     );
+    task.abort();
+}
+
+#[tokio::test]
+async fn workload_discovery_accepts_issuers_without_login_endpoints() {
+    let (provider, task) = mock_provider().await;
+    provider.workload_only_document.store(true, std::sync::atomic::Ordering::Relaxed);
+    let state = OidcState::new(&[config(&provider.issuer)], "https://registry.example").unwrap();
+    let token = sign(&payload(&provider.issuer), &provider.key);
+    assert_eq!(
+        state
+            .workload(&token)
+            .await
+            .unwrap()
+            .unwrap()
+            .identity
+            .username,
+        "ci",
+    );
+    assert_eq!(*provider.key_requests.lock().unwrap(), 1);
     task.abort();
 }
 
@@ -334,7 +364,7 @@ fn verifies_rs256_workload_tokens() {
     let signature =
         key.sign(&CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256, message.as_bytes()).unwrap();
     let token = format!("{message}.{}", BASE64_URL_SAFE_NO_PAD.encode(signature));
-    verify_workload(&config(issuer), &metadata, &token).unwrap();
+    verify_workload(&config(issuer), metadata.jwks(), &token).unwrap();
 }
 
 #[tokio::test]
