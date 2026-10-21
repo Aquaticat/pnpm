@@ -38,7 +38,7 @@ use openidconnect::{
     OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, TokenResponse,
     core::{
         CoreAuthenticationFlow, CoreClient, CoreClientAuthMethod, CoreIdToken, CoreIdTokenVerifier,
-        CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreTokenResponse,
+        CoreJsonWebKeySet, CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreTokenResponse,
     },
 };
 use p256::ecdsa::{Signature, SigningKey};
@@ -120,7 +120,11 @@ impl OidcState {
         if provider.config.login.is_none() {
             return Err(RegistryError::NotFound);
         }
-        let metadata = self.metadata(provider, MetadataFreshness::Cached).await?;
+        let metadata = self
+            .metadata(provider, MetadataFreshness::Cached)
+            .await?
+            .login
+            .ok_or_else(rejected)?;
         let client = self.login_client(provider, metadata)?;
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
         let (url, state, nonce) = client
@@ -155,7 +159,11 @@ impl OidcState {
         let _exchange = self.exchanges.try_acquire().map_err(|_| unavailable())?;
         self.record_attempt(&login.state_hash)?;
         let provider = self.providers.get(provider_name).ok_or_else(rejected)?;
-        let metadata = self.metadata(provider, MetadataFreshness::Cached).await?;
+        let metadata = self
+            .metadata(provider, MetadataFreshness::Cached)
+            .await?
+            .login
+            .ok_or_else(rejected)?;
         let response = self
             .login_client(provider, metadata.clone())?
             .exchange_code(AuthorizationCode::new(code.to_string()))
@@ -167,7 +175,7 @@ impl OidcState {
         let token = response.id_token().ok_or_else(rejected)?;
         let expiration = self.verified_expiration(
             provider,
-            &metadata,
+            metadata.jwks(),
             &response,
             token,
             &Nonce::new(login.nonce),
@@ -194,16 +202,16 @@ impl OidcState {
     async fn verified_expiration(
         &self,
         provider: &Provider,
-        metadata: &CoreProviderMetadata,
+        jwks: &CoreJsonWebKeySet,
         response: &CoreTokenResponse,
         token: &CoreIdToken,
         nonce: &Nonce,
     ) -> Result<i64> {
-        let mut verifier = token_verifier(&provider.config, metadata)?;
+        let mut verifier = token_verifier(&provider.config, jwks)?;
         if token.claims(&verifier, nonce).is_err() {
             verifier = token_verifier(
                 &provider.config,
-                &self.metadata(provider, MetadataFreshness::Refetched).await?,
+                &self.metadata(provider, MetadataFreshness::Refetched).await?.jwks,
             )?;
         }
         let claims = token.claims(&verifier, nonce).map_err(|_| rejected())?;

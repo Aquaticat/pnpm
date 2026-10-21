@@ -1,0 +1,234 @@
+name: Publish patched pnpr
+
+# Aquaticat fork only.
+#
+# pnpr 0.1.0-alpha.11 answers every GitHub Actions OIDC workload publish with
+# HTTP 500 "OIDC provider unavailable": it parses GitHub's discovery document
+# as full openidconnect provider metadata, which requires an
+# `authorization_endpoint` that GitHub does not publish. This branch carries a
+# fix that reads only `issuer` and `jwks_uri` for workload-only providers.
+# Diagnosis: doc/troubleshooting/pnpr-oidc-github-actions-discovery.md in
+# Aquaticat/Monochromatic.
+#
+# Every push to this branch builds static musl pnpr binaries the same way
+# release.yml does, attaches them to a GitHub release, and pushes a multi-arch
+# image built from pnpr/docker/Dockerfile to ghcr.io/aquaticat/pnpr.
+# Tags avoid the `v*` and `pnpr@*` namespaces so release.yml never triggers.
+
+on:
+  push:
+    branches:
+      - pnpr-oidc-workload-discovery
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pnpr-patched-image
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan patched release names
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      pnpr_version: ${{ steps.names.outputs.pnpr_version }}
+      release_name: ${{ steps.names.outputs.release_name }}
+      image: ${{ steps.names.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Derive version, release, and image names
+        id: names
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -eu
+          pnpr_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' pnpr/crates/pnpr/Cargo.toml | head -n 1)
+          test -n "$pnpr_version"
+          short_sha=$(printf '%s' "$GITHUB_SHA" | cut -c 1-12)
+          {
+            echo "pnpr_version=$pnpr_version"
+            echo "release_name=${pnpr_version}-oidc-workload-discovery.${short_sha}"
+            echo "image=ghcr.io/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')/pnpr"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build pnpr ${{ matrix.code-target }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            code-target: linux-x64-musl
+          - target: aarch64-unknown-linux-musl
+            code-target: linux-arm64-musl
+    steps:
+      - name: Free up runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install cross
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        with:
+          tool: cross
+
+      - name: Add Rust target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup target add "$TARGET"
+
+      - name: Install crates
+        uses: $/.github/actions/install-crates
+        with:
+          container-build: 'true'
+
+      - name: Build with cross
+        env:
+          TARGET: ${{ matrix.target }}
+        run: .github/scripts/cross-build.sh --locked -p pnpr --bin pnpr --release --target="$TARGET"
+
+      - name: Archive binary with checksum
+        env:
+          TARGET: ${{ matrix.target }}
+          CODE_TARGET: ${{ matrix.code-target }}
+        run: |
+          set -eu
+          bin_name="pnpr-${CODE_TARGET}"
+          mv "target/${TARGET}/release/pnpr" "$bin_name"
+          tar czf "${bin_name}.tar.gz" "$bin_name"
+          sha256sum "$bin_name" > "${bin_name}.sha256"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          if-no-files-found: error
+          name: binaries-pnpr-${{ matrix.code-target }}
+          path: |
+            *.tar.gz
+            *.sha256
+
+  github-release:
+    name: Publish GitHub release
+    needs:
+      - plan
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binaries-pnpr-linux-*-musl
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NAME: ${{ needs.plan.outputs.release_name }}
+          IMAGE: ${{ needs.plan.outputs.image }}
+        run: |
+          set -eu
+          gh release create "pnpr-patched-${RELEASE_NAME}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "pnpr ${RELEASE_NAME}" \
+            --notes "pnpr built from ${GITHUB_SHA} on branch pnpr-oidc-workload-discovery, which fixes GitHub Actions OIDC workload publishes failing with HTTP 500 \"OIDC provider unavailable\". Image: ${IMAGE}:${RELEASE_NAME}" \
+            pnpr-linux-*-musl.tar.gz pnpr-linux-*-musl.sha256
+
+  docker:
+    name: Publish image
+    needs:
+      - plan
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binaries-pnpr-linux-*-musl
+          merge-multiple: true
+
+      # Same staging as release.yml's docker-pnpr job: extract into a throwaway
+      # directory and move only checksum-verified regular files into the context.
+      - name: Stage binaries for the build context
+        id: stage
+        run: |
+          set -eu
+          rm -rf extracted
+          mkdir extracted
+          for f in pnpr-linux-*-musl.tar.gz; do
+            tar -xzf "$f" -C extracted --no-same-owner
+          done
+          ( cd extracted && sha256sum -c ../pnpr-linux-x64-musl.sha256 ../pnpr-linux-arm64-musl.sha256 )
+          for pair in x64:amd64 arm64:arm64; do
+            bin="extracted/pnpr-linux-${pair%:*}-musl"
+            test -f "$bin" && test ! -L "$bin"
+            mv "$bin" "pnpr/docker/pnpr-${pair#*:}"
+          done
+          {
+            echo "sha_amd64=$(awk '{print $1}' pnpr-linux-x64-musl.sha256)"
+            echo "sha_arm64=$(awk '{print $1}' pnpr-linux-arm64-musl.sha256)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./pnpr/docker
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ needs.plan.outputs.image }}:${{ needs.plan.outputs.release_name }}
+            ${{ needs.plan.outputs.image }}:oidc-workload-discovery
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            PNPR_VERSION=${{ needs.plan.outputs.pnpr_version }}
+            PNPR_SHA256_AMD64=${{ steps.stage.outputs.sha_amd64 }}
+            PNPR_SHA256_ARM64=${{ steps.stage.outputs.sha_arm64 }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Report digest
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          RELEASE_NAME: ${{ needs.plan.outputs.release_name }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: echo "::notice title=pnpr image::${IMAGE}:${RELEASE_NAME}@${DIGEST}"

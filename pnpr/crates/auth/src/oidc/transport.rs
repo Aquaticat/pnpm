@@ -6,7 +6,7 @@ use super::{
 };
 
 impl OidcState {
-    async fn http_request(&self, request: HttpRequest) -> Result<HttpResponse> {
+    pub(super) async fn http_request(&self, request: HttpRequest) -> Result<HttpResponse> {
         secure_url(&request.uri().to_string())?;
         network::validate_destination(&request.uri().to_string())?;
         let (parts, body) = request.into_parts();

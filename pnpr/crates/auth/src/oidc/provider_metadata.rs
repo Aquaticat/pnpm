@@ -3,8 +3,8 @@
 //! how often a failed discovery is retried.
 
 use super::{
-    CoreProviderMetadata, Duration, Instant, IssuerUrl, OidcState, Provider, Result, rejected,
-    secure_url, unavailable,
+    CoreJsonWebKeySet, CoreProviderMetadata, Duration, Instant, IssuerUrl, OidcState, Provider,
+    Result, rejected, secure_url, unavailable,
 };
 
 const METADATA_TTL: Duration = Duration::from_mins(5);
@@ -19,9 +19,18 @@ pub(super) enum MetadataFreshness {
     Refetched,
 }
 
+/// What discovery fetched for one provider. Workload verification reads only
+/// the signing keys; browser login also needs the provider's endpoints, which
+/// workload-only issuers, such as GitHub Actions, do not publish.
+#[derive(Clone)]
+pub(super) struct Discovered {
+    pub(super) jwks: CoreJsonWebKeySet,
+    pub(super) login: Option<CoreProviderMetadata>,
+}
+
 #[derive(Default)]
 pub(super) struct MetadataCache {
-    pub(super) value: Option<(Instant, CoreProviderMetadata)>,
+    pub(super) value: Option<(Instant, Discovered)>,
     pub(super) attempted_at: Option<Instant>,
 }
 
@@ -30,7 +39,7 @@ impl OidcState {
         &self,
         provider: &Provider,
         freshness: MetadataFreshness,
-    ) -> Result<CoreProviderMetadata> {
+    ) -> Result<Discovered> {
         let cached = cached_metadata(&*provider.metadata.lock().await, freshness);
         if let Some(metadata) = cached {
             return Ok(metadata);
@@ -47,21 +56,26 @@ impl OidcState {
             cache.attempted_at = Some(Instant::now());
         }
         let issuer = IssuerUrl::new(provider.config.issuer.clone()).map_err(|_| rejected())?;
-        let metadata =
-            CoreProviderMetadata::discover_async(issuer, self).await.map_err(|_| unavailable())?;
-        secure_url(metadata.authorization_endpoint().as_str())?;
-        if let Some(endpoint) = metadata.token_endpoint() {
-            secure_url(endpoint.as_str())?;
-        }
-        provider.metadata.lock().await.value = Some((Instant::now(), metadata.clone()));
-        Ok(metadata)
+        let discovered = if provider.config.login.is_some() {
+            let metadata =
+                CoreProviderMetadata::discover_async(issuer, self).await.map_err(|_| unavailable())?;
+            secure_url(metadata.authorization_endpoint().as_str())?;
+            if let Some(endpoint) = metadata.token_endpoint() {
+                secure_url(endpoint.as_str())?;
+            }
+            Discovered { jwks: metadata.jwks().clone(), login: Some(metadata) }
+        } else {
+            Discovered { jwks: self.workload_keys(&issuer).await?, login: None }
+        };
+        provider.metadata.lock().await.value = Some((Instant::now(), discovered.clone()));
+        Ok(discovered)
     }
 }
 
 fn cached_metadata(
     cache: &MetadataCache,
     freshness: MetadataFreshness,
-) -> Option<CoreProviderMetadata> {
+) -> Option<Discovered> {
     let unexpired = cache.value
         .as_ref()
         .filter(|(fetched, _)| fetched.elapsed() < METADATA_TTL);
